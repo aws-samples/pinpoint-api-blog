@@ -1,1 +1,586 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  PinpointApplicationId:
+    Type: String
+    Description: The ID of the Amazon Pinpoint application that you want to export data from.
+  FirehoseDeliveryStreamArn:
+    Type: String
+    Description: 'The ARN of the Kinesis Firehose delivery stream (optional)'
+    Default: ''
+  S3BucketArn:
+    Type: String
+    Description: 'The ARN of the S3 bucket (optional)'
+    Default: ''
+  Conditions:
+    HasFirehoseDeliveryStreamArn: !Not [!Equals ['',!Ref FirehoseDeliveryStreamARN]]
+    HasS3BucketArn: !Not [!Equals ['', !Ref S3BucketArn]]
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName: !Ref S3BucketName
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  PinpointEventStream:
+    Type: AWS::Pinpoint::EventStream
+    Properties:
+      ApplicationId: !Ref PinpointApplicationId
+      DestinationStreamArn: !GetAtt KinesisFirehoseDeliveryStream.Arn
+      RoleArn: !GetAtt PinpointKinesisStreamRole.Arn
+  PinpointKinesisStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - pinpoint.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "firehose:PutRecordBatch"
+                  - "firehose:DescribeDeliveryStream"
+                Resource: !GetAtt KinesisFirehoseDeliveryStream.Arn
+  PinpointKinesisFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - 
+                Effect: "Allow"
+                Action:
+                  - "s3:AbortMultipartUpload"
+                  - "s3:GetBucketLocation"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${S3Bucket}*"
+              - 
+                Effect: "Allow"
+                Action:
+                   - 'lambda:InvokeFunction'
+                Resource: !GetAtt MyLambdaFunction.Arn
+ 
+  KinesisFirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt S3Bucket.Arn
+        RoleARN: !GetAtt PinpointKinesisFirehoseRole.Arn
+        Prefix: pinpoint-events/
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 1
+        CompressionFormat: UNCOMPRESSED
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt MyLambdaFunction.Arn 
+              Type: Lambda 
+  MyLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt MyLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import base64
+          import json
+          from datetime import datetime
+          import boto3
+          from decimal import Decimal
+
+          # Initialize the DynamoDB resource
+          dynamodb = boto3.resource('dynamodb')
+          pinpoint_live_events_table = dynamodb.Table('PinpointLiveEvents')
+
+          def lambda_handler(event, context):
+              output = []
+
+              if 'Records' in event:
+                  # This is a Kinesis Data Stream event
+                  for record in event['Records']:
+                      event_source = record.get('eventSource', '')
+                      print(f"Event Source: {event_source}")
+
+                      if event_source == 'aws:kinesis':
+                          # Access the data directly from the Kinesis Data Stream event
+                          raw_event_data = base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                          raw_event = json.loads(raw_event_data)
+                          event_type = raw_event.get('event_type', '')
+
+                          if event_type.startswith('_email.'):
+                              result = processEmailEvents(record, is_kds=True)
+                          elif event_type.startswith('_SMS.'):
+                              result = processSMSEvents(record, is_kds=True)
+                          else:
+                              print(f"Unknown event type for Kinesis Data Stream: {event_type}")
+                              result = { 'recordId': 'unknown', 'result': 'ProcessingFailed', 'data': raw_event_data }
+
+                          output.append(result)
+
+                          # Print the raw Kinesis Data Stream Record
+                          print(f"Raw Kinesis Data Stream Record: {record}")
+
+              elif 'deliveryStreamArn' in event and 'records' in event:
+                  # This is a Kinesis Data Firehose event
+                  for record in event['records']:
+                      event_source = record.get('eventSource', '')
+                      print(f"Event Source: {event_source}")
+                      # Decode the data for Kinesis Data Firehose events
+                      raw_event_data = base64.b64decode(record['data']).decode('utf-8')
+                      raw_event = json.loads(raw_event_data)
+                      event_type = raw_event.get('event_type', '')
+
+                      if event_type.startswith('_email.'):
+                          result = processEmailEvents(record, is_kds=False)
+                      elif event_type.startswith('_SMS.'):
+                          result = processSMSEvents(record, is_kds=False)
+                      else:
+                          print(f"Unknown event type for Kinesis Data Firehose: {event_type}")
+                          result = { 'recordId': 'unknown', 'result': 'ProcessingFailed', 'data': raw_event_data }
+
+                      output.append(result)
+
+                      # Print the raw Kinesis Data Firehose Record
+                      print(f"Raw Kinesis Data Firehose Record: {record}")
+              else:
+                  print("Unknown event source")
+
+              return {'records': output}
+
+          def processEmailEvents(record, is_kds):
+              try:
+                  # Decode and load the Kinesis Data Streams/Firehose data
+                  if is_kds:
+                      # This is a Kinesis Data Stream event
+                      # Decode and load the Kinesis data stream
+                      raw_data_str = base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                      raw_event = json.loads(raw_data_str)
+                      print(raw_event)
+                      print(f"Raw Record for Kinesis Data streams record {record['kinesis']['sequenceNumber']}: {raw_event}")
+                  else:
+                      # This is a Kinesis Data Firehose event
+                      # Decode and load the Firehose data
+                      raw_data_str = base64.b64decode(record['data']).decode('utf-8')
+                      raw_event = json.loads(raw_data_str)
+                      print(raw_event)
+                      print(f"Raw Record for Firehose record {record['recordId']}: {raw_event}")
+
+                  # Retrieve message_id and process event_type to remove the '_email.' prefix
+                  message_id = raw_event.get('facets', {}).get('email_channel', {}).get('mail_event', {}).get('mail', {}).get('message_id', None)
+                  event_type = raw_event.get('event_type', 'unknown')
+                  if event_type.startswith('_email.'):
+                      event_type = event_type.replace('_email.', '')
+
+                  # Retrieve additional fields
+                  aws_account_id = raw_event.get('awsAccountId')
+                  from_address = raw_event.get('facets', {}).get('email_channel', {}).get('mail_event', {}).get('mail', {}).get('from_address')
+                  destination = raw_event.get('facets', {}).get('email_channel', {}).get('mail_event', {}).get('mail', {}).get('destination', [])
+                  client = raw_event.get('client', {}).get('client_id')
+                  campaign_id = raw_event.get('attributes', {}).get('campaign_id')
+                  journey_id = raw_event.get('attributes', {}).get('journey_id')
+
+                  # Convert arrival_timestamp from Unix time to a human-readable format
+                  unix_timestamp = raw_event.get('arrival_timestamp', datetime.now().timestamp())
+                  event_timestamp = datetime.fromtimestamp(unix_timestamp / 1000).strftime('%B %dth %Y, %I:%M %p, UTC')
+
+                  if not message_id:
+                      if is_kds:
+                          print(f"Error: Missing message_id for Firehose record {record['eventID']}")
+                          return {'sequenceNumber': record['kinesis']['sequenceNumber'], 'result': 'ProcessingFailed',
+                                  'data': record['kinesis']['data']}
+                      else:
+                          print(f"Error: Missing message_id for Firehose record {record['recordId']}")
+                          return {'recordId': record['recordId'], 'result': 'ProcessingFailed', 'data': record['data']}
+
+                  # Check if a record exists for the message_id
+                  response = pinpoint_live_events_table.get_item(Key={'message_id': message_id})
+                  item = response.get('Item', {})
+
+                  # Prepare UpdateExpression and ExpressionAttributeValues
+                  update_expression = "SET eventSource = :eventSource, awsAccountId = :awsAccountId, #eventType = :newEventType, " \
+                                      "from_address = :from_address, destination = :destination, client = :client, " \
+                                      "campaign_id = :campaign_id, journey_id = :journey_id"
+
+                  expression_attribute_values = {
+                      ':eventSource': 'kds' if is_kds else 'kdf',
+                      ':awsAccountId': aws_account_id,
+                      ':newEventType': event_timestamp,
+                      ':from_address': from_address,
+                      ':destination': destination,
+                      ':client': client,
+                      ':campaign_id': campaign_id,
+                      ':journey_id': journey_id
+                  }
+
+
+                  # Update the item in DynamoDB
+                  pinpoint_live_events_table.update_item(
+                      Key={'message_id': message_id},
+                      UpdateExpression=update_expression,
+                      ExpressionAttributeValues=expression_attribute_values,
+                      ExpressionAttributeNames={
+                          "#eventType": event_type
+                      }
+                  )
+
+                  print("DynamoDB Updated Successfully for Email Event")
+
+                  # Encode the processed record back to base64
+                  output_data = base64.b64encode(json.dumps(raw_event).encode('utf-8')).decode('utf-8')
+                  if is_kds:
+                      return {'sequenceNumber': record['kinesis']['sequenceNumber'], 'result': 'Ok', 'data': output_data}
+                  else:
+                      return {'recordId': record['recordId'], 'result': 'Ok', 'data': output_data}
+
+              except Exception as e:
+                  if is_kds:
+                      print(f"Error processing Email Kinesis Data stream record: {e}")
+                      return {'sequenceNumber': record['kinesis']['sequenceNumber'], 'result': 'ProcessingFailed',
+                              'data': record['kinesis']['data']}
+                  else:
+                      print(f"Error processing Email Kinesis Firehose record: {e}")
+                      return {'recordId': record['recordId'], 'result': 'ProcessingFailed', 'data': record['kinesis']['data']}
+
+          def processSMSEvents(record, is_kds):
+              try:
+                  # Decode and load the Kinesis Data Streams/Firehose data
+                  if is_kds:
+                      # This is a Kinesis Data Stream event
+                      # Access the event data directly from the Kinesis Data Stream record
+                      raw_data_str = base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                      raw_event = json.loads(raw_data_str)
+                      print(raw_event)
+                      print(f"Raw Record for Kinesis Data streams record {record['kinesis']['sequenceNumber']}: {raw_event}")
+
+                  else:
+                      # This is a Kinesis Data Firehose event
+                      # Decode and load the Firehose data
+                      raw_data_str = base64.b64decode(record['data']).decode('utf-8')
+                      raw_event = json.loads(raw_data_str)
+                      print(raw_event)
+                      print(f"Raw Record for Firehose record {record['recordId']}: {raw_event}")
+
+                  # Extract SMS event details
+                  message_id = raw_event.get('attributes', {}).get('message_id')
+                  event_type = raw_event.get('event_type', 'unknown')
+                  record_status = raw_event.get('attributes', {}).get('record_status')
+
+                  if event_type.startswith('_SMS.'):
+                      event_type = event_type.replace('_SMS.', '')
+
+                  # Convert arrival_timestamp from Unix time to a human-readable format
+                  unix_timestamp = raw_event.get('arrival_timestamp', datetime.now().timestamp())
+                  event_timestamp = datetime.fromtimestamp(unix_timestamp / 1000).strftime('%B %dth %Y, %I:%M %p, UTC')
+                  price_in_millcents_usd = str(raw_event.get('metrics', {}).get('price_in_millicents_usd'));
+                  aws_account_id = raw_event.get('awsAccountId')
+                  price_in_millcents_usd = Decimal(str(raw_event.get('metrics', {}).get('price_in_millicents_usd')));
+
+                  # Directly add SMS-related fields to the DynamoDB update
+                  update_expression = f"SET eventSource = :eventSource, awsAccountId = :awsAccountId, #eventType = :newEventType, " \
+                                      "sender_request_id = :sender_request_id, campaign_activity_id = :campaign_activity_id, " \
+                                      "origination_phone_number = :origination_phone_number, " \
+                                      "destination_phone_number = :destination_phone_number, " \
+                                      "record_status = :record_status, iso_country_code = :iso_country_code, " \
+                                      "message_type = :message_type, campaign_id = :campaign_id, journey_id = :journey_id, " \
+                                      "price_in_millicents_usd = :price_in_millicents_usd"
+
+                  expression_attribute_values = {
+                      ':eventSource': 'kds' if is_kds else 'kdf',
+                      ':awsAccountId': aws_account_id,
+                      ':newEventType': event_timestamp,
+                      ':sender_request_id': raw_event.get('attributes', {}).get('sender_request_id'),
+                      ':campaign_activity_id': raw_event.get('attributes', {}).get('campaign_activity_id'),
+                      ':origination_phone_number': raw_event.get('attributes', {}).get('origination_phone_number'),
+                      ':destination_phone_number': raw_event.get('attributes', {}).get('destination_phone_number'),
+                      ':record_status': record_status,
+                      ':iso_country_code': raw_event.get('attributes', {}).get('iso_country_code'),
+                      ':message_type': raw_event.get('attributes', {}).get('message_type'),
+                      ':campaign_id': raw_event.get('attributes', {}).get('campaign_id'),
+                      ':journey_id': raw_event.get('attributes', {}).get('journey_id'),
+                      ':price_in_millicents_usd': price_in_millcents_usd
+                  }
+
+                  # Update the item in DynamoDB
+                  pinpoint_live_events_table.update_item(
+                      Key={'message_id': message_id},
+                      UpdateExpression=update_expression,
+                      ExpressionAttributeValues=expression_attribute_values,
+                      ExpressionAttributeNames={
+                          "#eventType": event_type
+                      }
+                  )
+
+                  print("DynamoDB Updated Successfully for SMS Event")
+                  # Encode the processed record back to base64
+                  output_data = base64.b64encode(json.dumps(raw_event).encode('utf-8')).decode('utf-8')
+
+                  if is_kds:
+                      return {'sequenceNumber': record['kinesis']['sequenceNumber'], 'result': 'Ok', 'data': output_data}
+                  else:
+                      return {'recordId': record['recordId'], 'result': 'Ok', 'data': output_data}
+
+              except Exception as e:
+                  if is_kds:
+                      print(f"Error processing SMS Kinesis Data stream record: {e}")
+                      return {'sequenceNumber': record['kinesis']['sequenceNumber'], 'result': 'ProcessingFailed',
+                              'data': record['kinesis']['data']}
+                  else:
+                      print(f"Error processing SMS Firehose record: {e}")
+                      return {'recordId': record['recordId'], 'result': 'Ok', 'data': output_data}
+      Runtime: python3.9
+      Timeout: 60
+  MyLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "LambdaPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+        - PolicyName: "DynamoDBAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:PutItem"
+                  - "dynamodb:GetItem"
+                  - "dynamodb:UpdateItem"
+                Resource: !GetAtt PinpointLiveEventsTable.Arn
+  PinpointLiveEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: message_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: message_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+      
+
+  apiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: "GetMessageAPI"
+      Description: "Getting message id"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+  apiGatewayRootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations
+          - lambdaArn: !GetAtt GetMessageIDLambda.Arn
+      ResourceId: !GetAtt apiGateway.RootResourceId
+      RestApiId: !Ref apiGateway
+    
+  apiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - apiGatewayRootMethod
+    Properties:
+      RestApiId: !Ref apiGateway
+
+  apiGatewayStage:   
+    Type: AWS::ApiGateway::Stage
+    Properties: 
+      StageName: "call"
+      AccessLogSetting:
+        DestinationArn: !GetAtt apiGatewayLogGroup.Arn
+        Format: $context.extendedRequestId $context.identity.sourceIp $context.identity.caller $context.identity.user [$context.requestTime] "$context.httpMethod $context.resourcePath $context.protocol" $context.status $context.responseLength $context.requestId
+      DeploymentId: !Ref apiGatewayDeployment
+      RestApiId: !Ref apiGateway
+
+  apiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+        LogGroupName: !Sub /aws/apigateway/
+        RetentionInDays: 90
+
+  apiGwAccountConfig:
+    Type: "AWS::ApiGateway::Account"
+    Properties:
+      CloudWatchRoleArn: !GetAtt "apiGatewayLoggingRole.Arn"
+
+  apiGatewayLoggingRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "apigateway.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+  GetMessageIDLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt DynamoLambdaIAMRole.Arn
+      Runtime: python3.9
+      ReservedConcurrentExecutions: 1
+      Code:
+        ZipFile: |
+            import json
+            import boto3
+            def lambda_handler(event, context):
+                dynamodb = boto3.resource('dynamodb')
+                table = dynamodb.Table('PinpointLiveEvents')
+                
+                if event['httpMethod'] == "GET":
+                    # GET method logic
+                    if 'queryStringParameters' in event and 'message_id' in event['queryStringParameters']:
+                        message_id = event['queryStringParameters']['message_id']
+                        response = table.get_item(
+                            Key={
+                                'message_id': message_id
+                            }
+                        )
+                        if 'Item' in response:
+                            return {
+                                "statusCode": 200,
+                                "body": json.dumps(response['Item'])
+                            }
+                        else:
+                            return {
+                                "statusCode": 404,
+                                "body": "Item not found"
+                            }
+                    else:
+                        return {
+                            "statusCode": 400,
+                            "body": "Invalid request parameters"
+                        }
+                else:
+                    return {
+                        "statusCode": 400,
+                        "body": "Unsupported method"
+                    }
+  lambdaApiGatewayInvoke:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !GetAtt GetMessageIDLambda.Arn
+        Principal: apigateway.amazonaws.com
+        SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${apiGateway}/call/ANY/
+
+  DynamoLambdaIAMRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - sts:AssumeRole
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+        Policies:
+        - PolicyName: "DynamoDBAccess"
+          PolicyDocument:
+                  Version: "2012-10-17"
+                  Statement:
+                    - Effect: "Allow"
+                      Action:
+                        - "dynamodb:PutItem"
+                        - "dynamodb:GetItem"
+                        - "dynamodb:UpdateItem"
+                      Resource: !GetAtt PinpointLiveEventsTable.Arn
+        - PolicyName: "LambdaPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"               
+Outputs:
+  S3Bucket:
+    Value: !Ref S3Bucket
+  FirehoseDeliveryStreamName:
+    Value: !Ref KinesisFirehoseDeliveryStream
+  MyLambdaFunctionName:
+    Description: "Name of the Lambda Function"
+    Value: !GetAtt MyLambdaFunction.Arn
+  DyanmoDBTable:
+    Value: !Ref PinpointLiveEventsTable
+  apiGatewayInvokeURL:
+    Value: !Sub https://${apiGateway}.execute-api.${AWS::Region}.amazonaws.com/call
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
