@@ -9,7 +9,7 @@ When a customer recieves a time sensitive email or SMS, the customer experience 
 
 ## Architecture
 
-[TODO]
+![image](https://github.com/aws-samples/pinpoint-api-blog/assets/88910408/f16e7cd9-5765-4742-8057-1aa2dcd52fbf)
 
 ## Getting started
 
