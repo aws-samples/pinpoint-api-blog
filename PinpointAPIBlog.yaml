@@ -4,26 +4,10 @@ Parameters:
   PinpointApplicationId:
     Type: String
     Description: The ID of the Amazon Pinpoint application that you want to export data from.
-  FirehoseDeliveryStreamArn:
-    Type: String
-    Description: 'The ARN of the Kinesis Firehose delivery stream (optional)'
-    Default: ''
-  S3BucketArn:
-    Type: String
-    Description: 'The ARN of the S3 bucket (optional)'
-    Default: ''
-  Conditions:
-    HasFirehoseDeliveryStreamArn: !Not [!Equals ['',!Ref FirehoseDeliveryStreamARN]]
-    HasS3BucketArn: !Not [!Equals ['', !Ref S3BucketArn]]
+
 Resources:
   S3Bucket:
     Type: AWS::S3::Bucket
-    Properties: 
-      BucketName: !Ref S3BucketName
-      BucketEncryption: 
-        ServerSideEncryptionConfiguration: 
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
   PinpointEventStream:
     Type: AWS::Pinpoint::EventStream
     Properties:
@@ -94,6 +78,7 @@ Resources:
   KinesisFirehoseDeliveryStream:
     Type: AWS::KinesisFirehose::DeliveryStream
     Properties:
+      DeliveryStreamName: MyDeliveryStream
       ExtendedS3DestinationConfiguration:
         BucketARN: !GetAtt S3Bucket.Arn
         RoleARN: !GetAtt PinpointKinesisFirehoseRole.Arn
@@ -114,6 +99,7 @@ Resources:
     Properties:
       Handler: index.lambda_handler
       Role: !GetAtt MyLambdaRole.Arn
+      FunctionName: "MyLambdaFunction"
       Code:
         ZipFile: |
           import base64
@@ -305,7 +291,7 @@ Resources:
                   # Convert arrival_timestamp from Unix time to a human-readable format
                   unix_timestamp = raw_event.get('arrival_timestamp', datetime.now().timestamp())
                   event_timestamp = datetime.fromtimestamp(unix_timestamp / 1000).strftime('%B %dth %Y, %I:%M %p, UTC')
-                  price_in_millcents_usd = str(raw_event.get('metrics', {}).get('price_in_millicents_usd'));
+
                   aws_account_id = raw_event.get('awsAccountId')
                   price_in_millcents_usd = Decimal(str(raw_event.get('metrics', {}).get('price_in_millicents_usd')));
 
@@ -361,6 +347,15 @@ Resources:
                   else:
                       print(f"Error processing SMS Firehose record: {e}")
                       return {'recordId': record['recordId'], 'result': 'Ok', 'data': output_data}
+
+              except Exception as e:
+                    if is_kds:
+                        print(f"Error processing SMS Kinesis Data stream record: {e}")
+                        return {'sequenceNumber': record['kinesis']['sequenceNumber'], 'result': 'ProcessingFailed',
+                                'data': record['kinesis']['data']}
+                    else:
+                        print(f"Error processing SMS Firehose record: {e}")
+                        return {'recordId': record['recordId'], 'result': 'Ok', 'data': output_data}
       Runtime: python3.9
       Timeout: 60
   MyLambdaRole:
@@ -397,6 +392,7 @@ Resources:
   PinpointLiveEventsTable:
     Type: AWS::DynamoDB::Table
     Properties:
+      TableName: PinpointLiveEvents
       AttributeDefinitions:
         - AttributeName: message_id
           AttributeType: S
@@ -405,12 +401,10 @@ Resources:
           KeyType: HASH
       BillingMode: PAY_PER_REQUEST
 
-      
-
   apiGateway:
     Type: AWS::ApiGateway::RestApi
     Properties:
-      Name: "GetMessageAPI"
+      Name: "APIGatewayAPI"
       Description: "Getting message id"
       EndpointConfiguration:
         Types:
@@ -477,7 +471,6 @@ Resources:
       Handler: index.lambda_handler
       Role: !GetAtt DynamoLambdaIAMRole.Arn
       Runtime: python3.9
-      ReservedConcurrentExecutions: 1
       Code:
         ZipFile: |
             import json
@@ -555,7 +548,9 @@ Resources:
                   - "logs:CreateLogGroup"
                   - "logs:CreateLogStream"
                   - "logs:PutLogEvents"
-                Resource: "arn:aws:logs:*:*:*"               
+                Resource: "arn:aws:logs:*:*:*"
+                
+
 Outputs:
   S3Bucket:
     Value: !Ref S3Bucket
@@ -568,7 +563,6 @@ Outputs:
     Value: !Ref PinpointLiveEventsTable
   apiGatewayInvokeURL:
     Value: !Sub https://${apiGateway}.execute-api.${AWS::Region}.amazonaws.com/call
-
 
 
 
