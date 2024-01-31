@@ -29,7 +29,7 @@ To get started and deploy the code in your AWS account please follow the current
 2. Follow these instructions to test an SMS message: https://docs.aws.amazon.com/pinpoint/latest/userguide/messages-sms.html
 3. Navigate to Cloudwatch and look at ‘aws/lambda/ProcessingLambdaFunction’ logs. This will allow you to check if the Kinesis Firehose records have been successfully recorded.
 4. Navigate to DynamoDB. Choose **Tables**. Next, choose **PinpointLiveEvents**. Then, choose **Explore Table Items**. Copy the message_id for the data you would like to query for later.
-5. Navigate to API Gateway and choose **MessageIDApi**. Then navigate to **Stages**. Copy the url under **Invoke URL**.
+5. Navigate to API Gateway and choose the API that has been created. Then navigate to **Stages**. Copy the url under **Invoke URL**.
 6. Lastly, open your terminal. Type the following command: curl “http://www.apigateway.com/call?message_id=1234”. Replace URL with the url you copied from API Gateway and replace the message_id with the id you copied from DynamoDB. 
 
 ## Requirements
