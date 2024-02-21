@@ -15,7 +15,9 @@ When a customer recieves a time sensitive email or SMS, the customer experience 
 
 To get started and deploy the code in your AWS account please follow the current guides:
 
-### Deployment
+## Solution Deployment & Testing
+
+Deploying this solution is a straightforward process, thanks to the AWS CloudFormation template we've created. This template automates the creation and configuration of the necessary AWS resources into an AWS stack. The CloudFormation template ensures that the components such as Kinesis Data Firehose, AWS Lambda, Amazon DynamoDB, and Amazon API Gateway are set up consistently and correctly.
 
 
 1. Download the AWS CF and navigate to the AWS CloudFormation console under the AWS region you want to deploy the solution.
