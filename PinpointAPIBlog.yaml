@@ -4,6 +4,7 @@ Parameters:
   PinpointApplicationId:
     Type: String
     Description: The ID of the Amazon Pinpoint application that you want to export data from.
+  
 
 Resources:
   S3Bucket:
@@ -73,12 +74,11 @@ Resources:
                 Effect: "Allow"
                 Action:
                    - 'lambda:InvokeFunction'
-                Resource: !GetAtt MyLambdaFunction.Arn
+                Resource: !GetAtt ProcessingLambda.Arn
  
   KinesisFirehoseDeliveryStream:
-    Type: AWS::KinesisFirehose::DeliveryStream
-    Properties:
-      DeliveryStreamName: MyDeliveryStream
+    Type: AWS::KinesisFirehose::DeliveryStream 
+    Properties: 
       ExtendedS3DestinationConfiguration:
         BucketARN: !GetAtt S3Bucket.Arn
         RoleARN: !GetAtt PinpointKinesisFirehoseRole.Arn
@@ -92,25 +92,29 @@ Resources:
           Processors:
             - Parameters:
                 - ParameterName: LambdaArn
-                  ParameterValue: !GetAtt MyLambdaFunction.Arn 
+                  ParameterValue: !GetAtt ProcessingLambda.Arn 
               Type: Lambda 
-  MyLambdaFunction:
+  ProcessingLambda:
     Type: "AWS::Lambda::Function"
     Properties:
       Handler: index.lambda_handler
       Role: !GetAtt MyLambdaRole.Arn
-      FunctionName: "MyLambdaFunction"
+      Environment:
+        Variables:
+          DYNAMODB_TABLENAME: !Select [1, !Split ['/', !GetAtt PinpointLiveEventsTable.Arn]]
       Code:
         ZipFile: |
           import base64
           import json
           from datetime import datetime
           import boto3
+          import os
           from decimal import Decimal
 
           # Initialize the DynamoDB resource
           dynamodb = boto3.resource('dynamodb')
-          pinpoint_live_events_table = dynamodb.Table('PinpointLiveEvents')
+          dynamodb_tablename = os.environ['DYNAMODB_TABLENAME']
+          pinpoint_live_events_table = dynamodb.Table(dynamodb_tablename)
 
           def lambda_handler(event, context):
               output = []
@@ -293,7 +297,7 @@ Resources:
                   event_timestamp = datetime.fromtimestamp(unix_timestamp / 1000).strftime('%B %dth %Y, %I:%M %p, UTC')
 
                   aws_account_id = raw_event.get('awsAccountId')
-                  price_in_millcents_usd = Decimal(str(raw_event.get('metrics', {}).get('price_in_millicents_usd')));
+                  price_in_millcents_usd = str(raw_event.get('metrics', {}).get('price_in_millicents_usd'));
 
                   # Directly add SMS-related fields to the DynamoDB update
                   update_expression = f"SET eventSource = :eventSource, awsAccountId = :awsAccountId, #eventType = :newEventType, " \
@@ -392,7 +396,6 @@ Resources:
   PinpointLiveEventsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: PinpointLiveEvents
       AttributeDefinitions:
         - AttributeName: message_id
           AttributeType: S
@@ -404,7 +407,7 @@ Resources:
   apiGateway:
     Type: AWS::ApiGateway::RestApi
     Properties:
-      Name: "APIGatewayAPI"
+      Name: "MessageIdAPI"
       Description: "Getting message id"
       EndpointConfiguration:
         Types:
@@ -471,13 +474,19 @@ Resources:
       Handler: index.lambda_handler
       Role: !GetAtt DynamoLambdaIAMRole.Arn
       Runtime: python3.9
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          DYNAMODB_TABLENAME: !Select [1, !Split ['/', !GetAtt PinpointLiveEventsTable.Arn]]
       Code:
         ZipFile: |
             import json
             import boto3
+            import os
             def lambda_handler(event, context):
                 dynamodb = boto3.resource('dynamodb')
-                table = dynamodb.Table('PinpointLiveEvents')
+                dynamodb_tablename = os.environ['DYNAMODB_TABLENAME']
+                table = dynamodb.Table(dynamodb_tablename)
                 
                 if event['httpMethod'] == "GET":
                     # GET method logic
@@ -555,25 +564,11 @@ Outputs:
   S3Bucket:
     Value: !Ref S3Bucket
   FirehoseDeliveryStreamName:
-    Value: !Ref KinesisFirehoseDeliveryStream
-  MyLambdaFunctionName:
+    Value: !Ref  KinesisFirehoseDeliveryStream
+  ProcessingLambda:
     Description: "Name of the Lambda Function"
-    Value: !GetAtt MyLambdaFunction.Arn
+    Value: !GetAtt ProcessingLambda.Arn
   DyanmoDBTable:
     Value: !Ref PinpointLiveEventsTable
   apiGatewayInvokeURL:
     Value: !Sub https://${apiGateway}.execute-api.${AWS::Region}.amazonaws.com/call
-
-
-
-
-
-
-
-
-
-
-
-
-
-
