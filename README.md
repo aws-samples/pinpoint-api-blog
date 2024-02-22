@@ -49,7 +49,6 @@ To deploy this sample solution code, you will need:
 5. API Gateway Testing:
     * In the API Gateway console, find the MessageIdAPI.
     * Navigate to Stages and copy the Invoke URL provided.
-    * 
     * Open the text editor on your computer and paste the APIGateway invoke URL. 
     * Create a curl command with you API Gateway + ?message_id=message_id. It should look like this:
         * “https://txxxxxx0.execute-api.us-west-2.amazonaws.com/call?message_id=020100000xx3xxoo-clvxxxxf-8cq2-he0a-ji96-59nr4tgva0g0-000000”
